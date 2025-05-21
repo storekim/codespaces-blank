@@ -6,16 +6,12 @@ import itertools
 import time
 import concurrent.futures
 import matplotlib.pyplot as plt
+import ast
+import seaborn as sns
 
 class TestStrategy(bt.Strategy):
-    params = dict(
-        ma=200,
-        std=1,
-        rsi_period=14,
-        rsi_value=50,
-        rsi_overbought_or_oversold=0,
-        interest_series=None
-    )
+    
+    params = dict(ma=200,std=1,rsi_period=14,rsi_value=50,rsi_overbought_or_oversold=0,interest_series=None)
 
     def __init__(self):
         self.sma = bt.indicators.SMA(period=self.p.ma)
@@ -24,13 +20,16 @@ class TestStrategy(bt.Strategy):
         self.interest_series = self.p.interest_series
         self.last_date = None
         self.account_values = []
+        self.account_rates=[]
 
     def next(self):
         try:
             current_date = pd.Timestamp(self.datas[0].datetime.date(0))
-            origin_date = getattr(self.datas[0], 'log_origin_date', [current_date])[0]
-
-            if self.last_date and self.interest_series is not None and not self.position:
+            try:
+                origin_date = pd.Timestamp(self.datas[0].log_origin_date[0])
+            except (AttributeError, IndexError, KeyError):
+                origin_date = current_date
+            if self.last_date and self.interest_series is not None:
                 for i in range((current_date - self.last_date).days):
                     day = self.last_date + pd.Timedelta(days=i + 1)
                     rate = self.interest_series.get(origin_date, None)
@@ -39,50 +38,76 @@ class TestStrategy(bt.Strategy):
                         if not future.empty:
                             rate = self.interest_series.loc[future[0]]
                     if rate is not None:
-                        daily_interest = self.broker.get_cash() * (rate / 100) / 365
-                        self.broker.add_cash(daily_interest)
+                        if not self.position:
+                            daily_interest = self.broker.get_cash() * (rate / 100) / 365
+                            self.broker.add_cash(daily_interest)
+                
+                self.account_rates.append(((current_date - self.last_date).days*(rate / 100))/365+1)
+                self.account_values.append(self.broker.getvalue())
 
             self.last_date = current_date
-            self.account_values.append(self.broker.getvalue())
-
+            
             if not self.position:
                 if self.data.close > self.sma + self.std * self.p.std and (
                     (self.rsi < self.p.rsi_value and self.p.rsi_overbought_or_oversold == 0) or
                     (self.rsi > self.p.rsi_value and self.p.rsi_overbought_or_oversold == 1) or
                     self.p.rsi_overbought_or_oversold == 2):
                     self.buy(size=self.getsizing())
+            
             elif (self.data.close < self.sma + self.std * self.p.std and (
                 (self.rsi > self.p.rsi_value and self.p.rsi_overbought_or_oversold == 0) or
-                (self.rsi < self.p.rsi_value and self.p.rsi_overbought_or_oversold == 1))):
+                (self.rsi < self.p.rsi_value and self.p.rsi_overbought_or_oversold == 1) or
+                self.p.rsi_overbought_or_oversold == 2)):
                 self.close()
+            
         except Exception as e:
             print(e)
 
 
-def make_bootstrap_data(symbol='spx_d', smoothing=0.1):
-    log_data = pd.read_csv(f'C:/Users/Joachim Mencke/Desktop/bachelor/log_{symbol}.csv')
-    log_data['datetime'] = pd.to_datetime(log_data['datetime'], dayfirst=True)
-    reference_dates = log_data['datetime'].tolist()
-    newdata, prev_price, current_index = [], 16.66, 0
+def make_bootstrap_data(price_data: pd.DataFrame, smoothing=0.01):
+    """
+    Genererer bootstrappet prisdata ud fra en dataframe med open/close priser.
+
+    Parametre:
+    price_data (pd.DataFrame): Dataframe med kolonner ['datetime', 'Open', 'close']
+    smoothing (float): Sandsynlighed for at afslutte blok (geometrisk fordeling)
+
+    Returns:
+    pd.DataFrame: Bootstrappet datasæt med kolonner ['datetime', 'open', 'close', 'log_origin_date']
+    """
+    # Sørg for at datetime er korrekt type
+    price_data = price_data.copy()
+    price_data['datetime'] = pd.to_datetime(price_data['datetime'], dayfirst=True)
+
+    # Beregn log-return (logchange)
+    price_data['logchange'] = np.log10(price_data['close'] / price_data['close'].shift(1))
+    price_data = price_data.dropna().reset_index(drop=True)  # Drop første række uden logchange
+
+    reference_dates = price_data['datetime'].tolist()
+    newdata, prev_price, current_index = [], 1, 0
 
     while current_index < len(reference_dates):
-        block_start = rd.randint(0, len(log_data) - 1)
+        block_start = rd.randint(0, len(price_data) - 1)
         block_size = np.random.geometric(smoothing)
         for i in range(block_size):
-            if current_index >= len(reference_dates): break
-            log_row = log_data.iloc[(block_start + i) % len(log_data)]
+            if current_index >= len(reference_dates):
+                break
+            log_row = price_data.iloc[(block_start + i) % len(price_data)]
             log_change = log_row['logchange']
             new_price = prev_price * (10 ** log_change)
-            newdata.append([reference_dates[current_index], prev_price, new_price, log_row['datetime']])
-            prev_price, current_index = new_price, current_index + 1
+            newdata.append([
+                reference_dates[current_index],
+                prev_price,
+                new_price,
+                log_row['datetime']  # log_origin_date
+            ])
+            prev_price = new_price
+            current_index += 1
 
     return pd.DataFrame(newdata, columns=['datetime', 'open', 'close', 'log_origin_date'])
 
 
 def run_backtest(ma, std, rsi_period, rsi_value, rsi_overbought_or_oversold, data, interest_series):
-    initial_price, final_price = data.iloc[0]['close'], data.iloc[-1]['close']
-    buy_and_hold = (1 * data['close'] / initial_price).mean()
-
     cerebro = bt.Cerebro()
     cerebro.addstrategy(TestStrategy, ma=ma, std=std, rsi_period=rsi_period,
         rsi_value=rsi_value, rsi_overbought_or_oversold=rsi_overbought_or_oversold,
@@ -94,19 +119,26 @@ def run_backtest(ma, std, rsi_period, rsi_value, rsi_overbought_or_oversold, dat
     cerebro.addsizer(bt.sizers.PercentSizer, percents=99.9)
     cerebro.broker.setcommission(commission=0.00002, leverage=1)
     result = cerebro.run()[0]
+
     account_values = result.account_values
 
-    returns = pd.Series(np.diff(account_values) / account_values[:-1])
-    rf_daily = interest_series.mean() / 100 / 365
-    excess_returns = returns - rf_daily
-    strategy_mean = np.mean(excess_returns)
-    strategy_std = np.std(returns)
-    sharpe_ratio = strategy_mean / strategy_std if strategy_std != 0 else 0
+    #Strategi afkast  og Sharpe-ratio udregnes her kan ganges med 252**0.5 for at få årlig sharpe
+    log_returns = np.log10(account_values[1:]) - np.log10(account_values[:-1])
+    excess_returns=np.mean(log_returns)-np.mean(np.log10(result.account_rates[:-1]))
+    std=np.std(log_returns)
+    annual_sharpe_ratio=excess_returns/std
 
-    benchmark_returns = pd.Series(np.diff(data['close']) / data['close'][:-1])
-    benchmark_sharpe = (benchmark_returns - rf_daily).mean() / benchmark_returns.std()
+    #Benchmark afkast of Sharpe-ratio udregnes her kan ganges med 252**0.5 for at få årlig sharpe
+    log_returns_bench  = np.log10(data['close'].values[1:] / data['close'].values[:-1])
+    excess_returns_bench=np.mean(log_returns_bench)-np.mean(np.log10(result.account_rates[:-1]))
+    std_bench=np.std(log_returns_bench)
+    annual_sharpe_ratio_bench=excess_returns_bench/std_bench
 
-    return np.mean(account_values) - buy_and_hold, sharpe_ratio - benchmark_sharpe, benchmark_sharpe
+    #Forskellen mellem de to returnes til datahåndtering
+    return_diff=10**((np.mean(log_returns)-np.mean(log_returns_bench))*252)-1
+    sharpe_diff=annual_sharpe_ratio-annual_sharpe_ratio_bench
+
+    return return_diff, sharpe_diff
 
 
 def evaluate_strategy(params, data, interest_series):
@@ -119,11 +151,20 @@ def evaluate_strategy(params, data, interest_series):
 
 
 if __name__ == '__main__':
-    n_iterations = 1000
-    dtb = pd.read_csv('C:/Users/Joachim Mencke/Desktop/bachelor/DTB3.csv', parse_dates=['observation_date'])
+    n_iterations = 500
+
+    real_data = pd.read_csv(spx_d.csv', usecols=[0, 4, 1])
+    real_data['datetime'] = pd.to_datetime(real_data['datetime'], dayfirst=True)
+
+    start_date = '1954-01-01'
+    end_date = '2025-02-05'
+
+    real_data=real_data[(real_data['datetime'] >= start_date) & (real_data['datetime'] <= end_date)].sort_values(by='datetime').reset_index(drop=True)
+    dtb = pd.read_csv('DTB3.csv', parse_dates=['observation_date'])
+    dtb['observation_date'] = pd.to_datetime(dtb['observation_date'],dayfirst=True)
     dtb.set_index('observation_date', inplace=True)
     interest_series = dtb['DTB3'].ffill()
-
+    
     ma_period = [5, 20, 50, 200]
     std_dev = [-1, 0, 1]
     rsi_periods = [7, 14, 28]
@@ -132,92 +173,162 @@ if __name__ == '__main__':
 
     all_strategies = list(itertools.product(ma_period, std_dev, rsi_periods, rsi_values, [0, 1]))
     all_strategies += list(itertools.product(ma_period, std_dev, [14], [14], [2]))
+    
+    strategy_profites, strategy_sharpes = {}, {}
+    real_results_list=[]
 
-    real_data = pd.read_csv('C:/Users/Joachim Mencke/Desktop/bachelor/spx_d.csv', usecols=[0, 4, 1])
-    real_data['datetime'] = pd.to_datetime(real_data['datetime'], dayfirst=True)
-
-    strategy_losses, strategy_sharpes = {}, {}
     print("\nRunning strategies on real data...")
     with concurrent.futures.ProcessPoolExecutor() as executor:
         futures = {executor.submit(evaluate_strategy, params, real_data, interest_series): params for params in all_strategies}
         real_results = {key: val for key, val in (f.result() for f in concurrent.futures.as_completed(futures)) if val[0] is not None}
 
-    for key, (loss, sharpe,bench_sharpe) in real_results.items():
-        strategy_losses[key], strategy_sharpes[key] = [loss], [sharpe]
-        print(f"{key}: Loss={loss:.6f}, Sharpe={sharpe:.4f}")
-    real_max_loss = max([v[0] for v in real_results.values()])
-    real_max_sharpe = max([v[1] for v in real_results.values()])
-    print(f"\nMax Real Sharpe: {real_max_sharpe:.4f}, Max Real LossFunc: {real_max_loss:.4f}")
+    for key, (profit, sharpe) in real_results.items():
+        strategy_profites[key], strategy_sharpes[key] = [profit], [sharpe]
+        print(f"{key}: profit={profit:.6f}, Sharpe={sharpe:.4f}",)
+        real_results_list.append([key,profit, sharpe])
 
-    bootstrap_loss_beats_real = bootstrap_sharpe_beats_real = 0
-    list_max_loss=[]
-    list_max_sharpe=[]
-    for i in range(n_iterations):
+    real_results_dataframe=(pd.DataFrame(real_results_list,columns=['strategy','profit','sharpe']))
+    real_results_dataframe['strategy'] = real_results_dataframe['strategy'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+
+    real_max_profit = max([v[0] for v in real_results.values()])
+    real_max_sharpe = max([v[1] for v in real_results.values()])
+    print(f"\nMax Real Sharpe: {real_max_sharpe:.4f}, Max Real profitFunc: {real_max_profit:.4f}")
+
+    bootstrap_data = {}
+    print(f"\nGenerating {n_iterations} bootstrap datasets in parallel...")
+    start_bootstrap_time = time.time()
+
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        future_to_index = {
+            executor.submit(make_bootstrap_data, real_data): n for n in range(n_iterations)
+        }
+        bootstrap_data = {}
+        for future in concurrent.futures.as_completed(future_to_index):
+            n = future_to_index[future]
+            try:
+                bootstrap_data[f'bdata{n}'] = future.result()
+            except Exception as e:
+                print(f"Error generating bdata{n}: {e}")
+    print(f"Finished bootstrap generation in {time.time() - start_bootstrap_time:.2f} seconds.")
+
+    all_boot_data=[]
+    for strategy in (all_strategies):
         start_time=time.time()
-        print(f"\n--- Bootstrap Iteration {i+1}/{n_iterations} ---")
-        bdata = make_bootstrap_data('spx_d')
-        bdata['datetime'] = pd.to_datetime(bdata['datetime'], dayfirst=True)
+        current_data=[]
+        print(f"\n--- Evaluating Strategy {all_strategies.index(strategy)+1}/{len(all_strategies)}: '{strategy}' over {n_iterations} Bootstraps ---")
 
         with concurrent.futures.ProcessPoolExecutor() as executor:
-            futures = {executor.submit(evaluate_strategy, params, bdata, interest_series): params for params in all_strategies}
-            boot_results = {key: val for key, val in (f.result() for f in concurrent.futures.as_completed(futures)) if val[0] is not None}
+            futures = {executor.submit(evaluate_strategy, strategy, data, interest_series): name for name, data in bootstrap_data.items()}
 
-        max_loss = max(val[0] for val in boot_results.values())
-        max_sharpe = max(val[1] for val in boot_results.values())
+        boot_results = []
 
-        for key, (loss, sharpe,bench_sharpe) in boot_results.items():
-            strategy_losses[key].append(loss)
-            strategy_sharpes[key].append(sharpe)
-        if max_loss > real_max_loss:
-            bootstrap_loss_beats_real += 1
-        if max_sharpe > real_max_sharpe:
-            bootstrap_sharpe_beats_real += 1
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]  # Få navn på bootstrap (f.eks., 'bdata43')
+            try:
+                result = future.result()
+                if result is not None:
+                    strategy=result[0]
+                    profit=result[1][0]
+                    sharpe=result[1][1]
+                    boot_results.append([strategy, name,profit, sharpe]) 
 
-        list_max_loss.append(max_loss)
-        list_max_sharpe.append(max_sharpe)
-        print('Time spend on one iteration: ',time.time()-start_time)
-        print('max_loss: ',max_loss,'max_sharpe: ',max_sharpe)
+            except Exception as e:
+                print(f"Error processing {name}: {e}")
 
+        all_boot_data.extend(boot_results)
+        print(f"Time taken for strategy: {time.time() - start_time:.2f} seconds")
+
+    full_boot_dataframe=(pd.DataFrame(all_boot_data,columns=['strategy','bdata','profit','sharpe']))
+    full_boot_dataframe['strategy'] = full_boot_dataframe['strategy'].apply(lambda x: ast.literal_eval(x) if isinstance(x, str) else x)
+
+    full_boot_dataframe.to_csv(r'C:\Users\Joachim Mencke\Desktop\bachelor\data_folder\bootstrap_strategy_data{}.csv'.format(round(time.time())))
+    real_results_dataframe.to_csv(r'C:\Users\Joachim Mencke\Desktop\bachelor\data_folder\real_strategy_data{}.csv'.format(round(time.time())))
+
+    p_list_profit=[];p_list_sharpe=[];max_profit_list=[];max_sharpe_list=[];list_strategy_returns = [];list_strategy_sharpes = [];strategy_list=[]
+    bootstrap_sharpes=[]
+
+    for idx, strategy in enumerate(all_strategies):
+        print(f"Evaluating strategy {idx + 1}/{len(all_strategies)}: {strategy}")
+        #Der laves en liste med de strategier der evalueres(først evalueres 1 strategi, så 2, så 3 osv. op til antallet af strategier)
+        strategy_list.append(strategy)
+        boot_higher_profit=0 ; boot_higher_sharpe=0
+        current_max_profit=float('-inf') ; current_max_sharpe = float('-inf')
+        #Der bliver skabt et nyt datasæt med kun de strategier der bliver evalueret
+        filtered_dataframe = full_boot_dataframe[full_boot_dataframe['strategy'].apply(lambda x: x in strategy_list)]
+        filtered_real_dataframe=real_results_dataframe[real_results_dataframe['strategy'].apply(lambda x: x in strategy_list)]
+        #Der skal sammenlignes med det bedste resultat i det oprindelige data så det findes i det nu mindre univers
+        real_max_profit=filtered_real_dataframe['profit'].max()
+        real_max_sharpe=filtered_real_dataframe['sharpe'].max()
+        #Dette holder øje med når en nu bedste strategi filføjes til universet så dette kan plottes senere
+        if real_max_profit>current_max_profit:
+                current_max_profit=real_max_profit
+        if real_max_sharpe > current_max_sharpe:
+            current_max_sharpe = real_max_sharpe
+        #Dette laver en liste over resultater for hver strategi som også bruges til at plotte senere
+        list_strategy_returns.append(real_results_dataframe[real_results_dataframe['strategy'].apply(lambda x: x==strategy)]['profit'].values[0])
+        list_strategy_sharpes.append(real_results_dataframe[real_results_dataframe['strategy'].apply(lambda x: x == strategy)]['sharpe'].values[0])
         
+        #Denne løkke sammen med det efterfølgende regner p-værdien for kun de  strategier der evalueres
+        for n in range(n_iterations):
+            max_profit_bdatan = filtered_dataframe[filtered_dataframe['bdata'] == 'bdata{}'.format(n)]['profit'].max()
+            max_sharpe_bdatan = filtered_dataframe[filtered_dataframe['bdata'] == 'bdata{}'.format(n)]['sharpe'].max()
 
-    print(f"\nBootstraps beating real max loss: {bootstrap_loss_beats_real}/{n_iterations}")
-    print(f"Bootstraps beating real max sharpe: {bootstrap_sharpe_beats_real}/{n_iterations}")
+            if idx==0:
+                bootstrap_sharpes.append(max_sharpe_bdatan)
 
-    summary_df = pd.DataFrame({
-        'Strategy': list(strategy_losses.keys()),
-        'AvgLoss': [np.mean(v) for v in strategy_losses.values()],
-        'AvgSharpe': [np.mean(v) for v in strategy_sharpes.values()]
-    })
-    summary_df.to_csv('C:/Users/Joachim Mencke/Desktop/bachelor/strategy_summary.csv', index=False)
+            if max_profit_bdatan>real_max_profit:
+                boot_higher_profit+=1
+            if max_sharpe_bdatan>real_max_sharpe:
+                boot_higher_sharpe+=1
 
-    plt.figure(figsize=(10, 6))
-    plt.hist(summary_df['AvgLoss'], bins=30, edgecolor='black')
-    plt.xlabel('Afkast')
-    plt.ylabel('Antal')
-    plt.title('Gennemsnitligs afkast for hver strategi i bootstrap')
+        p_list_profit.append(boot_higher_profit/(n_iterations))
+        max_profit_list.append(current_max_profit)
+
+        p_list_sharpe.append(boot_higher_sharpe/(n_iterations))
+        max_sharpe_list.append(current_max_sharpe)
+
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+
+    ax1.plot(range(len(all_strategies)), p_list_profit, label='P-værdi for profit kriteriet', color='#f87c7c')
+    ax1.set_xlabel('Strategi nummer x')
+    ax1.set_ylabel('P-værdi', color='#f87c7c', fontsize=13)
+    ax1.tick_params(axis='y', labelcolor='black')
+
+    ax2 = ax1.twinx()  
+    ax2.plot(range(len(all_strategies)), max_profit_list, label='Maks Profit', color='#6fa3f8')
+    ax2.set_ylabel('Maks profit', color='#6fa3f8', fontsize=13)
+    ax2.tick_params(axis='y', labelcolor='black')
+
+    ax2.scatter(range(len(all_strategies)),list_strategy_returns, color='black', label='Reel afkast for strategi x', zorder=5,marker='x',alpha=0.6,s=30)
+
+    ax1.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.5)
+
+    plt.title('Whites Reality Check for afkast over antal af x strategier')
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10)
+    plt.tight_layout() 
     plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('strategy_avg_performance_histogram.png')
-    #plt.show()
 
-    plt.figure(figsize=(10, 6))
-    plt.hist(list_max_loss, bins=30, edgecolor='black')
-    plt.axvline(x=real_max_loss, color='red', linestyle='--', linewidth=2, label=f'Max afkast i reel data = {real_max_loss}')
-    plt.xlabel('Max afkast')
-    plt.ylabel('Antal')
-    plt.title('Histogram over gennemsnitligt max afkast for en strategi i hver iteration')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig('strategy_avg_performance_histogram.png')
-    #plt.show()
+    # --- Plot for Sharpe ---
+    fig, ax3 = plt.subplots(figsize=(10, 6))
 
-    plt.figure(figsize=(10, 6))
-    plt.hist(list_max_sharpe, bins=30, edgecolor='black')
-    plt.axvline(x=real_max_sharpe, color='red', linestyle='--', linewidth=2, label=f'Max sharpe i reel data = {real_max_sharpe}')
-    plt.xlabel('Max sharpe_ratio')
-    plt.ylabel('Antal')
-    plt.title('Histogram over gennemsnitligt max sharpe_ratio for en strategi i hver iteration')
-    plt.grid(True)
+    ax3.plot(range(len(all_strategies)), p_list_sharpe, label='P-værdi for Sharpe', color='#e7a87c')
+    ax3.set_xlabel('Strategi nummer x')
+    ax3.set_ylabel('P-værdi', color='#e7a87c', fontsize=13)
+    ax3.tick_params(axis='y', labelcolor='black')
+
+    ax4 = ax3.twinx()
+    ax4.plot(range(len(all_strategies)), max_sharpe_list, label='Maks Sharpe', color='#7cb9e7')
+    ax4.scatter(range(len(all_strategies)), list_strategy_sharpes, color='black', label='Reel Sharpe for strategi x', marker='x', alpha=0.6, s=30, zorder=5)
+    ax4.set_ylabel('Maks Sharpe', color='#7cb9e7', fontsize=13)
+    ax4.tick_params(axis='y', labelcolor='black')
+
+    ax3.grid(True, linestyle='--', linewidth=0.5, alpha=0.5)
+    lines3, labels3 = ax3.get_legend_handles_labels()
+    lines4, labels4 = ax4.get_legend_handles_labels()
+    ax3.legend(lines3 + lines4, labels3 + labels4, loc='upper left', fontsize=10)
+
+    plt.title('Whites Reality Check for Sharpe-ratio over x antal af strategier')
     plt.tight_layout()
-    plt.savefig('strategy_avg_performance_histogram.png')
     plt.show()
